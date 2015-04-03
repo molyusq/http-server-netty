@@ -24,7 +24,7 @@ class SimpleHttpServer {
     }
 
     void run() throws InterruptedException {
-        EventLoopGroup bossGroup = new NioEventLoopGroup(20);
+        EventLoopGroup bossGroup = new NioEventLoopGroup(1);
         EventLoopGroup workerGroup = new NioEventLoopGroup();
 
         try {

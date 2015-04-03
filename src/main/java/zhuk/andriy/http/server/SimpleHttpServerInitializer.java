@@ -22,9 +22,8 @@ public class SimpleHttpServerInitializer extends ChannelInitializer<SocketChanne
         channelGroup = new DefaultChannelGroup(channel.eventLoop());
         channelGroup.add(channel);
         ChannelTrafficShapingHandler channelTrafficShapingHandler = new ChannelTrafficShapingHandler(200);
-
-        pipeline.addLast(new HttpServerCodec());
         pipeline.addLast(channelTrafficShapingHandler);
+        pipeline.addLast(new HttpServerCodec());
         pipeline.addLast(new SimpleHttpServerHandler(channelGroup.size(),
                 channelTrafficShapingHandler.trafficCounter()));
     }
