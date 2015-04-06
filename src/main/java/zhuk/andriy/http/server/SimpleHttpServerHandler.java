@@ -6,11 +6,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
 
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.traffic.TrafficCounter;
 import io.netty.util.CharsetUtil;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import zhuk.andriy.http.server.util.*;
 
 import java.net.InetSocketAddress;
@@ -24,26 +28,33 @@ public class SimpleHttpServerHandler extends SimpleChannelInboundHandler<Object>
 
     private static RequestUtil requestUtil = new RequestUtil();
     private static RedirectUtil redirectUtil = new RedirectUtil();
-    private static ConnectionUtil connectionUtil = new ConnectionUtil();
+    private static ConcurrentHashMap<Channel, ConnectionInfo> connections = new ConcurrentHashMap<Channel, ConnectionInfo>();
     private TrafficCounter trafficCounter;
     private static final int LAST_REQUESTS_TO_SHOW = 16;
 
-    private int connections = 0;
+    private static ChannelGroup channelGroup = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
-    public SimpleHttpServerHandler(int connections, TrafficCounter trafficCounter) {
-        this.connections = connections;
+    public SimpleHttpServerHandler(TrafficCounter trafficCounter) {
         this.trafficCounter = trafficCounter;
-        this.trafficCounter.start();
+        //this.trafficCounter.start();
 
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext channelHandlerContext, Object message) throws ExecutionException, InterruptedException {
         if(message instanceof DefaultHttpRequest) {
-            connectionUtil.addConnection(((InetSocketAddress)channelHandlerContext.channel().remoteAddress()).getHostName(),
-                    ((DefaultHttpRequest) message).getUri());
-            QueryStringDecoder decoder = new QueryStringDecoder(((DefaultHttpRequest)message).getUri());
+            String uri = ((DefaultHttpRequest) message).getUri();
+            if(connections.get(channelHandlerContext.channel()).getUri() == null)
+                connections.get(channelHandlerContext.channel()).setUri(uri);
+            if(connections.get(channelHandlerContext.channel()).getUri().equals("/favicon.ico") ||
+                    connections.get(channelHandlerContext.channel()).getUri() == null)
+                connections.remove(channelHandlerContext.channel());
+            QueryStringDecoder decoder = new QueryStringDecoder(uri);
             FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+            if(!decoder.path().equals("/favicon.ico")) {
+                requestUtil.incrementTotalRequestCount();
+                requestUtil.setRequestInfo(((InetSocketAddress) channelHandlerContext.channel().remoteAddress()).getHostName());
+            }
             if(decoder.path().equals("/hello")) {
                 ScheduledExecutorService service = Executors.newScheduledThreadPool(20);
                 ScheduledFuture scheduledFuture = service.schedule(new Callable<Object>() {
@@ -53,21 +64,46 @@ public class SimpleHttpServerHandler extends SimpleChannelInboundHandler<Object>
                     }
                 }, 2, TimeUnit.SECONDS);
                 response = (FullHttpResponse)scheduledFuture.get();
+
             }
             if(decoder.path().startsWith("/redirect")) {
                 response = createRedirectResponse(decoder);
-            }
 
-            if(decoder.path().equals("/status")) {
-                response = createStatusResponse();
             }
-            if(!decoder.path().equals("/favicon.ico")) {
-                requestUtil.incrementTotalRequestCount();
-                requestUtil.setRequestInfo(((InetSocketAddress) channelHandlerContext.channel().remoteAddress()).getHostName());
+            if(decoder.path().equals("/status")) {
+                createStatusResponse(channelHandlerContext.channel());
+                response = createStatusResponse(channelHandlerContext.channel());
             }
             channelHandlerContext.writeAndFlush(response);
-        }
+            ConnectionInfo currentInfo = connections.get(channelHandlerContext.channel());
+            currentInfo.setDate();
+            currentInfo.setReadBytes(trafficCounter.cumulativeReadBytes());
+            currentInfo.setSentBytes(trafficCounter.cumulativeWrittenBytes());
+            currentInfo.setSpeed(trafficCounter.lastWrittenBytes());
 
+        }
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext channelHandlerContext) throws Exception {
+        String address = ((InetSocketAddress)channelHandlerContext.channel().remoteAddress()).getHostName();
+        if(!connections.contains(channelHandlerContext.channel()))
+            connections.put(channelHandlerContext.channel(), new ConnectionInfo(address));
+        channelGroup.add(channelHandlerContext.channel());
+        trafficCounter.start();
+        super.channelActive(channelHandlerContext);
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext channelHandlerContext) throws Exception {
+        trafficCounter.resetCumulativeTime();
+        trafficCounter.stop();
+        channelHandlerContext.close();
+        super.channelInactive(channelHandlerContext);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext channelHandlerContext, Throwable cause) {
         channelHandlerContext.close();
     }
 
@@ -85,16 +121,21 @@ public class SimpleHttpServerHandler extends SimpleChannelInboundHandler<Object>
         return response;
     }
 
-    private FullHttpResponse createStatusResponse() {
+    private FullHttpResponse createStatusResponse(Channel currentChannel) {
         FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
         StringBuilder buffer = new StringBuilder();
+        int channels = 0;
         buffer.append("<html>" + "<body>");
         buffer.append("<p><b>Total requests count:</b> " + requestUtil.getTotalRequestCount() + "</p>");
         buffer.append("<p><b>Unique requests count:</b> " + requestUtil.getUniqueRequestCount() + "</p>");
         showRequestStatistic(buffer);
         showRedirectionStatistic(buffer);
-        buffer.append("<p><b>Active connections:</b> " + connections + "</p>");
-        showConnectionStatistics(buffer);
+        for(Channel channel : channelGroup) {
+            if(channel.isActive())
+                channels++;
+        }
+        buffer.append("<p><b>Active connections:</b> " + channels + "</p>");
+        showConnectionStatistics(buffer, currentChannel);
         buffer.append("</body>" + "</html>");
         response.content().writeBytes(Unpooled.copiedBuffer(buffer, CharsetUtil.UTF_8));
         response.headers().set(HttpHeaders.Names.CONTENT_TYPE, "text/html");
@@ -128,28 +169,35 @@ public class SimpleHttpServerHandler extends SimpleChannelInboundHandler<Object>
         }
     }
 
-    private void showConnectionStatistics(StringBuilder buffer) {
-        if(connectionUtil.getConnectionQuantity() != 0) {
+
+    private void showOneConnectionStat(StringBuilder buffer, ConnectionInfo info) {
+        buffer.append("<tr><td>" + info.getAddress() + "</td><td>" + info.getUri() + "</td><td>" + info.getDate()
+                + "</td><td>" + info.getSentBytes() + "</td><td>" + info.getReadBytes() + "</td><td>"
+                + info.getSpeed() + "</td></tr>");
+    }
+
+    private void showConnectionStatistics(StringBuilder buffer, Channel currentChannel) {
+        List<Channel> channelList = new ArrayList<Channel>(connections.keySet());
+        if(channelList.size() != 0) {
+            ConnectionInfo currentInfo = connections.get(currentChannel);
+            currentInfo.setReadBytes(trafficCounter.cumulativeReadBytes());
+            currentInfo.setSentBytes(trafficCounter.cumulativeWrittenBytes());
+            currentInfo.setDate();
+            currentInfo.setSpeed(trafficCounter.lastWrittenBytes());
             buffer.append("<p>Connections:</p>");
             buffer.append("<table border=\"1\">");
             buffer.append("<tr><th>src_ip</th>" + "<th>URI</th>" + "<th>Timestamp</th></th>" +
-                    "<th>sent_bytes</th>" + "<th>received_bytes</th>" + "<th>speed, bytes</th></tr>");
-            if(connectionUtil.getConnectionQuantity() < LAST_REQUESTS_TO_SHOW) {
-                for(String  ip : connectionUtil.getAllIPs()) {
-                    ConnectionInfo info = connectionUtil.getConnectionInfo(ip);
-                    buffer.append("<tr><td>" + ip + "</td><td>" + info.getUri() + "</td><td>" + info.getDate()
-                            + "</td><td>" + trafficCounter.cumulativeWrittenBytes() + "</td><td>"
-                            + trafficCounter.cumulativeReadBytes() + "</td><td>"
-                            + trafficCounter.cumulativeWrittenBytes()/trafficCounter.lastCumulativeTime() + "</td></tr>");
+                    "<th>sent_bytes</th>" + "<th>received_bytes</th>" + "<th>speed, bytes/s</th></tr>");
+            if(channelList.size() < LAST_REQUESTS_TO_SHOW) {
+                for(Channel channel: channelList) {
+                    ConnectionInfo info = connections.get(channel);
+                    showOneConnectionStat(buffer, info);
                 }
             } else {
-                List<String> ipList = new ArrayList<String>(connectionUtil.getAllIPs());
-                for(int i=0; i < LAST_REQUESTS_TO_SHOW; i++) {
-                    ConnectionInfo info = connectionUtil.getConnectionInfo(ipList.get(i));
-                    buffer.append("<tr><td>" + ipList.get(i) + "</td><td>" + info.getUri() + "</td><td>" + info.getDate()
-                            + "</td><td>" + trafficCounter.cumulativeWrittenBytes() + "</td><td>"
-                            + trafficCounter.cumulativeReadBytes() + "</td><td>"
-                            + trafficCounter.lastWrittenBytes() + "</td></tr>");
+                int size = channelList.size() - 1;
+                for(int i = size; i > size - LAST_REQUESTS_TO_SHOW + 1; i--) {
+                    ConnectionInfo info = connections.get(channelList.get(i));
+                    showOneConnectionStat(buffer, info);
                 }
             }
             buffer.append("</table>");
